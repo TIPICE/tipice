@@ -1,0 +1,242 @@
+# pip install pyupbit pandas pandas_ta python-dateutil
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+import pyupbit
+from datetime import datetime, timedelta
+
+# ---------------------------
+# 1) 데이터 수집 (Upbit KRW-BTC 일봉 전체)
+# ---------------------------
+def fetch_all_ohlcv_upbit(ticker="KRW-BTC", interval="day", max_loops=200):
+    """
+    Upbit 일봉 전체 이력을 뒤로 돌며 수집합니다. (200개씩 페이징)
+    """
+    frames = []
+    to = None
+    for _ in range(max_loops):
+        df = pyupbit.get_ohlcv(ticker=ticker, interval=interval, to=to, count=200)
+        if df is None or df.empty:
+            break
+        frames.append(df)
+        oldest = df.index.min()
+        # 다음 루프는 가장 오래된 캔들 직전 시각으로 이동
+        to = (oldest - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+        # 안전장치: 너무 과도한 요청 방지
+        if len(frames) > 1000:
+            break
+    if not frames:
+        raise RuntimeError("시세 수집 실패")
+    all_df = pd.concat(frames).sort_index().drop_duplicates()
+    # Upbit 컬럼 이름 통일: open, high, low, close, volume, value
+    return all_df
+
+# ---------------------------
+# 2) 보조지표 계산
+# ---------------------------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # 이동평균(20), 이격도(20)
+    out["SMA20"] = out["close"].rolling(20).mean()
+    out["DISP20"] = out["close"] / out["SMA20"] * 100.0
+
+    # Stochastic RSI (14,14,3,3) -> SRI로 표기(%K)
+    sr = ta.stochrsi(out["close"], length=14, rsi_length=14, k=3, d=3)
+    if sr is not None:
+        out["SRI_K"] = sr.iloc[:, 0]   # STOCHRSIk
+        out["SRI_D"] = sr.iloc[:, 1]   # STOCHRSId
+
+    # MACD (12,26,9)
+    macd = ta.macd(out["close"], fast=12, slow=26, signal=9)
+    if macd is not None:
+        out["MACD"] = macd.iloc[:, 0]
+        out["MACD_SIGNAL"] = macd.iloc[:, 2]  # 일부 버전에선 [1]=hist, [2]=signal
+
+    # Stochastic Slow (14,3,3)
+    st = ta.stoch(out["high"], out["low"], out["close"], k=14, d=3, smooth_k=3)
+    if st is not None:
+        out["STOCH_SLOW_K"] = st.iloc[:, 0]
+        out["STOCH_SLOW_D"] = st.iloc[:, 1]
+
+    # Bollinger Bands (20,2) - %B
+    bb = ta.bbands(out["close"], length=20, std=2)
+    if bb is not None:
+        # 컬럼명 접두사가 버전에 따라 다를 수 있으므로 '%B' 컬럼 탐색
+        bbp_col = [c for c in bb.columns if "%B" in c or "BBP" in c]
+        out["BB_PCTB"] = bb[bbp_col[0]] if bbp_col else np.nan
+
+    # CCI(20)
+    cci = ta.cci(out["high"], out["low"], out["close"], length=20)
+    out["CCI20"] = cci
+
+    return out
+
+# ---------------------------
+# 3) ZigZag 기반 저점→고점 구간 탐지
+# ---------------------------
+def zigzag_trough_peak_indices(df: pd.DataFrame, pct=0.15):
+    """
+    간단 ZigZag 방식
+    - pct: 전환 임계치 (예: 0.15 = 15%)
+    - 저점 인식 후 high가 +pct 이상 상승하면 '상승 전환'으로 보고 해당 구간의 고점을 탐색
+    - 고점 인식 후 low가 -pct 이상 하락하면 '하락 전환'으로 보고 다음 저점을 탐색
+    반환:
+      trough_idxs, peak_idxs, pairs ([(t_idx, p_idx), ...])
+    """
+    highs = df["high"].values
+    lows  = df["low"].values
+    n = len(df)
+
+    troughs = []
+    peaks   = []
+    pairs   = []
+
+    state = "search_trough"
+    min_i, min_low = 0, lows[0]
+    max_i, max_high = 0, highs[0]
+    got_trough = False
+
+    for i in range(1, n):
+        if state == "search_trough":
+            # 더 낮은 저점 갱신
+            if lows[i] < min_low:
+                min_low = lows[i]
+                min_i = i
+            # (저점 대비) pct 이상 상승 → 저점 확정, 고점 탐색 전환
+            if highs[i] >= min_low * (1 + pct):
+                troughs.append(min_i)
+                state = "search_peak"
+                max_i, max_high = i, highs[i]
+        else:  # search_peak
+            # 더 높은 고점 갱신
+            if highs[i] > max_high:
+                max_high = highs[i]
+                max_i = i
+            # (고점 대비) pct 이상 하락 → 고점 확정, 다음 저점 탐색
+            if lows[i] <= max_high * (1 - pct):
+                peaks.append(max_i)
+                pairs.append((troughs[-1], max_i))
+                state = "search_trough"
+                min_i, min_low = i, lows[i]
+
+    # 루프 종료 후 고점 대기 상태라면 마지막 고점 확정
+    if state == "search_peak" and troughs:
+        peaks.append(max_i)
+        pairs.append((troughs[-1], max_i))
+
+    # 안전: 인덱스 정합성
+    pairs = [(t, p) for (t, p) in pairs if p > t]
+    return troughs, peaks, pairs
+
+# ---------------------------
+# 4) 리포트 생성 (상위 10개 ROI)
+# ---------------------------
+def build_top_trades_report(df: pd.DataFrame, pct=0.15, topn=10):
+    troughs, peaks, pairs = zigzag_trough_peak_indices(df, pct=pct)
+    if not pairs:
+        raise RuntimeError("탐지된 스윙 구간이 없습니다. ZZ 임계치(pct)를 낮춰보세요.")
+
+    # 다음 저점(피크 이후) 매핑을 위해 troughs를 정렬된 상태로 활용
+    # 각 피크 인덱스보다 뒤에 오는 첫 trough를 찾음
+    results = []
+    for (t_idx, p_idx) in pairs:
+        buy_dt   = df.index[t_idx]
+        sell_dt  = df.index[p_idx]
+        buy_low  = float(df.loc[buy_dt, "low"])
+        sell_high= float(df.loc[sell_dt, "high"])
+        roi_pct  = (sell_high / buy_low - 1.0) * 100.0
+
+        # 피크 이후 다음 트로프 (있다면) → 고점 대비 하락폭
+        next_trough_idx = None
+        for ti in troughs:
+            if ti > p_idx:
+                next_trough_idx = ti
+                break
+        post_drop_pct = np.nan
+        post_drop_days = np.nan
+        if next_trough_idx is not None:
+            nt_dt = df.index[next_trough_idx]
+            next_low = float(df.loc[nt_dt, "low"])
+            post_drop_pct = (next_low / sell_high - 1.0) * 100.0
+            post_drop_days = (nt_dt - sell_dt).days
+
+        # 보조지표(매수/매도 시점)
+        row = {
+            "buy_time":  buy_dt.strftime("%Y-%m-%d"),
+            "buy_low":   round(buy_low, 2),
+            "sell_time": sell_dt.strftime("%Y-%m-%d"),
+            "sell_high": round(sell_high, 2),
+            "ROI_pct":   round(roi_pct, 2),
+            "PostDrop_toNextTrough_pct": None if np.isnan(post_drop_pct) else round(post_drop_pct, 2),
+            "PostDrop_days": None if np.isnan(post_drop_days) else int(post_drop_days),
+        }
+
+        # 매수 시점 지표
+        for col_src, col_dst in [
+            ("volume", "buy_volume"),
+            ("SRI_K",  "buy_sri"),
+            ("MACD",   "buy_macd"),
+            ("MACD_SIGNAL","buy_macd_signal"),
+            ("STOCH_SLOW_K","buy_stoch_k"),
+            ("STOCH_SLOW_D","buy_stoch_d"),
+            ("BB_PCTB", "buy_bb_pctb"),
+            ("CCI20",   "buy_cci"),
+            ("DISP20",  "buy_disp20"),
+        ]:
+            v = df.loc[buy_dt, col_src] if col_src in df.columns else np.nan
+            row[col_dst] = None if pd.isna(v) else (round(float(v), 4) if isinstance(v, (int,float,np.floating)) else v)
+
+        # 매도 시점 지표
+        for col_src, col_dst in [
+            ("volume", "sell_volume"),
+            ("SRI_K",  "sell_sri"),
+            ("MACD",   "sell_macd"),
+            ("MACD_SIGNAL","sell_macd_signal"),
+            ("STOCH_SLOW_K","sell_stoch_k"),
+            ("STOCH_SLOW_D","sell_stoch_d"),
+            ("BB_PCTB", "sell_bb_pctb"),
+            ("CCI20",   "sell_cci"),
+            ("DISP20",  "sell_disp20"),
+        ]:
+            v = df.loc[sell_dt, col_src] if col_src in df.columns else np.nan
+            row[col_dst] = None if pd.isna(v) else (round(float(v), 4) if isinstance(v, (int,float,np.floating)) else v)
+
+        results.append(row)
+
+    # ROI 기준 상위 10개
+    res_df = pd.DataFrame(results).sort_values("ROI_pct", ascending=False).head(topn).reset_index(drop=True)
+    return res_df
+
+# ---------------------------
+# 5) 메인
+# ---------------------------
+if __name__ == "__main__":
+    # 파라미터
+    TICKER = "KRW-BTC"
+    ZZ_PCT = 0.15   # 15% 변동으로 스윙 전환 감지 (민감도: 낮추면 스윙 많아짐, 올리면 굵직한 스윙만)
+    TOPN   = 10
+
+    print("데이터 수집중...")
+    df = fetch_all_ohlcv_upbit(TICKER, interval="day")
+    # 보조지표 계산
+    df = add_indicators(df)
+
+    print("스윙 구간 분석중...")
+    report = build_top_trades_report(df, pct=ZZ_PCT, topn=TOPN)
+
+    # 저장 및 표시
+    out_csv = f"btc_top{TOPN}_trough2peak_report.csv"
+    out_xlsx = f"btc_top{TOPN}_trough2peak_report.xlsx"
+    report.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    try:
+        report.to_excel(out_xlsx, index=False)
+    except Exception:
+        pass
+
+    # 콘솔 요약
+    pd.set_option("display.max_columns", None)
+    print("\n=== ROI 상위 10개 저점→고점 리포트 ===")
+    print(report)
+    print(f"\nCSV 저장: {out_csv}")
+    print(f"XLSX 저장: {out_xlsx}")
