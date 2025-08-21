@@ -1,0 +1,378 @@
+# -*- coding: utf-8 -*-
+"""
+📌 일봉 + 4시간봉 조건이 동시에 만족할 때만 매매하는 프로그램
+   + 전체 포트폴리오 수익률이 -2% 이하일 때 전량 손절
+   + 5종목을 선정하여 보유 원화의 20%씩 분할 매수
+
+[전략 흐름]
+1. 매 5분마다 모든 종목의 매수/매도 신호를 확인
+2. 매수 신호가 뜨면 보유 현금의 20%씩 5종목 매수
+3. 매도 신호가 뜨면 해당 종목 전량 매도
+4. 전체 포트폴리오가 -2% 손실이면 모든 종목 전량 매도
+"""
+import time
+import numpy as np
+import pandas as pd
+import pyupbit
+from datetime import datetime
+
+# ===============================
+# 1. 사용자 설정 (API 키와 기본 설정)
+# ===============================
+ACCESS = "b2VTQoW5F7ftGITzLSLPRoQoJuxx3rPCxyhvN6Z6"  # 업비트 Open API에서 발급받은 Access Key
+SECRET = "5Sa4zfoxx9JoXx87rbD6j6cmUmBMYdTRSCxQoZlo"  # 업비트 Open API에서 발급받은 Secret Key
+# ⬇️ 자동 선정/수동 고정 중 선택
+USE_AUTO_TOP5 = True
+MANUAL_TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-ADA"]  # USE_AUTO_TOP5=False일 때 사용
+
+CHECK_INTERVAL = 300    # 전략 반복 주기 (초) → 300초 = 5분마다 실행
+SLEEP_API = 0.12        # API 호출 간 대기 시간 (업비트 제한 회피용)
+MIN_ORDER_KRW = 5000    # 업비트 최소 주문 금액 (5천원)
+
+# 포트폴리오 손절 한도
+PORTFOLIO_CUT_PCT = -2.0  # -2% 이하이면 전량 매도
+
+upbit = pyupbit.Upbit(ACCESS, SECRET)
+# ===============================
+# 2. OHLCV(시가,고가,저가,종가,거래량) 데이터 가져오기
+# ===============================
+def get_ohlcv(ticker: str, interval: str, count: int = 120) -> pd.DataFrame:
+    """
+    업비트에서 캔들 데이터 가져오기
+    ticker: 종목명 (예: "KRW-BTC")
+    interval: "day"(일봉), "minute240"(4시간봉)
+    count: 가져올 캔들 개수
+    """
+    df = pyupbit.get_ohlcv(ticker, interval=interval, count=count)
+    if df is None or df.empty:
+        raise RuntimeError(f"{ticker} {interval} 데이터 가져오기 실패")
+    return df
+
+def latest_completed_index(df: pd.DataFrame) -> int:
+    """
+    마지막으로 완성된 봉의 인덱스 반환
+    - df의 마지막 행은 현재 진행 중인 캔들이므로, 그 전(-2)을 사용
+    """
+    return -2 if len(df) >= 2 else -1
+
+# ===============================
+# 3. 보조지표 계산 (Stochastic Slow, 이격도)
+# ===============================
+def calc_stochastic_slow(df: pd.DataFrame, n: int = 14, k_slow: int = 3, d_slow: int = 3):
+    """
+    Slow Stochastic 계산
+    Fast %K = (종가 - N기간 최저가) / (N기간 최고가 - N기간 최저가) * 100
+    Slow %K = Fast %K의 k_slow기간 이동평균
+    Slow %D = Slow %K의 d_slow기간 이동평균
+    """
+    high_n = df["high"].rolling(n).max()  # N일 중 최고가
+    low_n = df["low"].rolling(n).min()    # N일 중 최저가
+    denom = (high_n - low_n)              # 분모 (고가-저가)
+
+    # 분모가 0인 경우 NaN 방지
+    fast_k = 100 * (df["close"] - low_n) / denom.replace(0, np.nan)
+    fast_k = fast_k.fillna(method="bfill").fillna(method="ffill")  # NaN 채우기
+
+    slow_k = fast_k.rolling(k_slow).mean()  # Slow %K
+    slow_d = slow_k.rolling(d_slow).mean()  # Slow %D
+    return slow_k, slow_d
+
+def calc_disparity_current_price(df: pd.DataFrame, current_price: float, ma_period: int = 20, idx: int = -2):
+    """
+    현재가 기준 이격도 계산
+    = (현재가 / 이동평균선) * 100
+    """
+    ma_series = df["close"].rolling(ma_period).mean()
+    ma_val = float(ma_series.iloc[idx])
+    if ma_val == 0 or np.isnan(ma_val):
+        return None
+    return (current_price / ma_val) * 100
+
+# ===============================
+# 4. 현재가 및 잔고 조회
+# ===============================
+def get_current_price(ticker: str) -> float:
+    """현재가 조회"""
+    return pyupbit.get_current_price(ticker)
+
+def get_krw_balance() -> float:
+    """보유 원화 조회"""
+    balances = upbit.get_balances()
+    for b in balances:
+        if b["currency"] == "KRW":
+            return float(b.get("balance", 0) or 0)
+    return 0.0
+
+def get_coin_balance(ticker: str) -> float:
+    """보유 코인 수량 조회"""
+    symbol = ticker.split("-")[1]
+    balances = upbit.get_balances()
+    for b in balances:
+        if b["currency"] == symbol:
+            return float(b.get("balance", 0) or 0)
+    return 0.0
+
+# ===============================
+# 5. 매수 / 매도 함수
+# ===============================
+def buy_limit_by_krw(ticker: str, use_krw: float, ref_price: float):
+    if use_krw < MIN_ORDER_KRW:
+        print(f"[매수 건너뜀] 최소주문금액 미만({use_krw:.0f}) - {ticker}")
+        return
+    p = int(round(ref_price))
+    qty = round(use_krw / p, 8)
+    try:
+        upbit.buy_limit_order(ticker, p, qty)
+        print(f"[매수 주문] {ticker} {p}원 x {qty}개 (약 {use_krw:.0f} KRW)")
+    except Exception as e:
+        print(f"[매수 실패] {ticker} - {e}")
+
+def sell_limit_all_coin(ticker: str, price: float):
+    """
+    보유 코인 전량 지정가 매도
+    """
+    qty = get_coin_balance(ticker)
+    if qty <= 0:
+        print("[매도 불가] 보유 수량 없음")
+        return
+    p = int(round(price))
+    try:
+        upbit.sell_limit_order(ticker, p, qty)
+        print(f"[매도 주문] {ticker} {p}원, {qty}개")
+    except Exception as e:
+        print(f"[매도 실패] {e}")
+
+def sell_limit_all_holdings_at_market_price_snapshot():
+    """
+    보유 중인 모든 코인을 '현재가'로 지정가 전량 매도 (스냅샷 기반)
+    """
+    balances = upbit.get_balances()
+    tickers = [f"KRW-{b['currency']}" for b in balances
+               if b["currency"] != "KRW" and float(b.get("balance", 0) or 0) > 0]
+    if not tickers:
+        print("[전량 매도] 보유 코인 없음")
+        return
+    prices = pyupbit.get_current_price(tickers)
+    # 단일 티커일 때 prices가 float로 반환될 수 있어 보정
+    if isinstance(prices, float) or isinstance(prices, int):
+        prices = {tickers[0]: float(prices)}
+    for t in tickers:
+        pr = float(prices.get(t, 0) or 0)
+        if pr > 0:
+            sell_limit_all_coin(t, pr)
+            time.sleep(SLEEP_API)
+
+# ===============================
+# 6. 조건 체크 함수
+# ===============================
+def get_signal_for_timeframe(df: pd.DataFrame, current_price: float):
+    """
+    주어진 데이터프레임(일봉/4시간봉)에서 매수/매도 조건 체크
+    + 이격도 조건은 매수/매도에서 제외하고 별도 알림
+    """
+    # ✅ Stochastic Slow 계산
+    slow_k, slow_d = calc_stochastic_slow(df)
+
+    # 마지막 완료된 봉의 인덱스
+    idx = latest_completed_index(df)
+
+    # 현재 봉의 %K, %D
+    k_now = float(slow_k.iloc[idx])
+    d_now = float(slow_d.iloc[idx])
+
+    # 이전 봉의 %K, %D
+    k_prev = float(slow_k.iloc[idx-1]) if len(df) >= 3 else np.nan
+    d_prev = float(slow_d.iloc[idx-1]) if len(df) >= 3 else np.nan
+
+    # 현재가 기반 이격도 계산 (20기간)
+    disp = calc_disparity_current_price(df, current_price, 20, idx)
+
+    # 📌 매수 조건: 골든크로스 + %K가 20선 돌파
+    buy_cond = (
+        (k_prev < d_prev) and      # 이전 봉에서 %K < %D
+        (k_now > d_now) and        # 현재 %K > %D
+        (k_prev <= 20) and         # 이전 봉 %K ≤ 20
+        (k_now > 5)               # 현재 봉 %K > 10
+    )
+
+    # 📌 매도 조건: %K와 %D가 모두 80 이상이고, %K가 %D를 하향 돌파
+    sell_cond = (
+        (k_prev >= 80) and 
+        (k_prev > d_prev) and
+        (k_now < d_now)
+    )
+
+    # 📢 이격도 알림
+    disparity_alert = (disp is not None and disp <= 80)
+
+    return {
+        "buy": buy_cond,
+        "sell": sell_cond,
+        "disp_alert": disparity_alert,  # 이격도 조건 알림
+        "disp_value": disp,             # 현재 이격도 값
+        "bar_time": df.index[idx]
+    }
+# ===============================
+# 7) 종목 선정
+# ===============================
+def get_top_tickers_by_value(n=5):
+    """
+    최근 24시간 거래대금 상위 종목 반환
+    """
+    all_krw = pyupbit.get_tickers(fiat="KRW")
+    vals = []
+    for t in all_krw:
+        try:
+            df = pyupbit.get_ohlcv(t, interval="minute30", count=48)  # 30분봉 × 48개 = 약 24시간
+            v = float(df["value"].sum())
+            vals.append((t, v))
+            time.sleep(0.05)
+        except:
+            continue
+    vals.sort(key=lambda x: x[1], reverse=True)
+    return [t for t, _ in vals[:n]]
+
+def choose_universe():
+    """종목 선택 (자동 or 수동)"""
+    if USE_AUTO_TOP5:
+        u = get_top_tickers_by_value(5)
+        print("[자동 선정 종목]", u)
+        return u
+    return MANUAL_TICKERS[:5]
+
+# ===============================
+# 8) 포트폴리오 전체 손익률 계산
+# ===============================
+def get_portfolio_return_pct():
+    """
+    전체 포트폴리오의 손익률(%) 계산
+    """
+    balances = upbit.get_balances()
+    coins = [b for b in balances if b["currency"] != "KRW" and float(b.get("balance", 0) or 0) > 0]
+    if not coins:
+        return None
+
+    tickers = [f"KRW-{b['currency']}" for b in coins]
+    prices = pyupbit.get_current_price(tickers)
+    if isinstance(prices, float):
+        prices = {tickers[0]: prices}
+
+    total_cost = 0
+    total_value = 0
+    for b in coins:
+        ticker = f"KRW-{b['currency']}"
+        qty = float(b["balance"])
+        avg = float(b["avg_buy_price"])
+        pr = prices.get(ticker, 0)
+        total_cost += avg * qty
+        total_value += pr * qty
+
+    return (total_value - total_cost) / total_cost * 100.0
+
+
+# ===============================
+# 9. 메인 실행 루프
+# ===============================
+if __name__ == "__main__":
+    print("전략 시작: 5분마다 실행 / 일봉+4시간봉 동시 조건 / 포트폴리오 -2% 손절")
+
+    last_trade_keys = set()  # 중복 주문 방지
+    universe = choose_universe()  # 매수 후보 종목 선정
+
+    while True:
+        try:
+            # 1) 전체 포트폴리오 손절 체크
+            port_ret = get_portfolio_return_pct()
+            if port_ret is not None and port_ret <= PORTFOLIO_CUT_PCT:
+                print(f"[손절] 전체 수익률 {port_ret:.2f}% → 전량 매도")
+                sell_limit_all_holdings_at_market_price_snapshot()
+
+            # 2) 각 종목별 매수/매도 신호 확인
+            cur_prices = pyupbit.get_current_price(universe)
+            if isinstance(cur_prices, float):
+                cur_prices = {universe[0]: cur_prices}
+
+            buy_candidates = []
+            # 3) 종목별로 일봉/4시간봉 시그널 확인
+            for t in universe:
+                cp = cur_prices.get(t, 0)
+                if cp <= 0:
+                    continue
+                
+                # 일봉/4시간봉 데이터 가져오기
+                df_day = get_ohlcv(t, "day")
+                time.sleep(SLEEP_API)
+                df_4h = get_ohlcv(t, "minute240")
+                time.sleep(SLEEP_API)
+                
+                # 매수/매도 신호 판단
+                sig_day = get_signal_for_timeframe(df_day, cp)
+                sig_4h = get_signal_for_timeframe(df_4h, cp)
+
+                # 매도 조건 충족 시 전량 매도
+                if sig_day["sell"] and sig_4h["sell"]:
+                     # 같은 캔들에서 중복 매도 방지
+                    key_sell = (t, sig_day["bar_time"], sig_4h["bar_time"], "SELL")
+                    if key_sell not in last_trade_keys:
+                        sell_limit_all_coin(t, cp)
+                        last_trade_keys.add(key_sell)
+
+                # (B) 매수 후보: 둘 다 매수 신호면 후보에 추가
+                if sig_day["buy"] and sig_4h["buy"]:
+                    key_buy = (t, sig_day["bar_time"], sig_4h["bar_time"], "BUY")
+                    # 같은 캔들에서 중복 매수 방지 (한 번만 진입)
+                    if key_buy not in last_trade_keys:
+                        buy_candidates.append((t, cp, key_buy))
+
+            # 4) n등분 매수 로직
+            #    - buy_candidates 에 담긴 종목 수 = n
+            #    - 보유 원화를 n등분해서 각각 동일 금액으로 매수
+            #    - 단, 업비트 최소주문금액(5000원) 제약이 있으므로, 그보다 작아지면
+            #      실제 매수 가능한 종목 수(m)를 줄여서 금액을 재배분합니다.
+            if buy_candidates:
+                # 상위 5개까지만 고려 (요구사항: 거래대금 상위 5위 안에서 n개)
+                buy_candidates = buy_candidates[:5]
+
+                # 현재 보유 원화 스냅샷 (이 값으로 등분 금액을 계산)
+                krw_snapshot = get_krw_balance()
+
+                # 실제 매수 가능한 최대 종목 수(최소주문금액을 만족하는 수)를 계산
+                # 예) 12,000원이면 2종목까지만 가능(각 6,000원) → 3종목으로 나누면 4,000원이라 최소주문 미달
+                max_affordable = int(krw_snapshot // MIN_ORDER_KRW)  # 최소주문금액 기준으로 가능한 "최대" 종목 수
+                n = len(buy_candidates)
+
+                if max_affordable <= 0:
+                    print(f"[매수 건너뜀] 원화 부족 (보유 {krw_snapshot:.0f}원, 최소주문 {MIN_ORDER_KRW}원)")
+                else:
+                    # 실제로 매수에 사용할 종목 수 m = min(n, max_affordable)
+                    m = min(n, max_affordable)
+
+                    # 매수 대상으로 최종 m개만 사용
+                    exec_list = buy_candidates[:m]
+
+                    # m등분 금액(각 종목 동일 금액)
+                    per_ticket_krw = krw_snapshot / m
+
+                    # per_ticket_krw가 혹시나 반올림 등으로 최소주문금액보다 약간 작아질 수 있어 마지막에 한 번 더 점검
+                    if per_ticket_krw < MIN_ORDER_KRW:
+                        # 이 경우는 거의 없지만, 안전하게 m을 1 줄여 다시 계산
+                        # (여유가 안되면 아예 매수 스킵)
+                        m2 = int(krw_snapshot // MIN_ORDER_KRW)
+                        if m2 <= 0:
+                            print(f"[매수 건너뜀] 원화 부족 (보유 {krw_snapshot:.0f}원)")
+                            exec_list = []
+                        else:
+                            exec_list = buy_candidates[:m2]
+                            per_ticket_krw = krw_snapshot / m2
+
+                    # 최종 실행
+                    for (t, cp, key_buy) in exec_list:
+                        buy_limit_by_krw(t, per_ticket_krw, cp)
+                        last_trade_keys.add(key_buy)
+                        time.sleep(SLEEP_API)
+
+            # 5) 루프 대기 (5분)
+        except Exception as e:
+            print("[오류]", e)
+
+        time.sleep(CHECK_INTERVAL)
